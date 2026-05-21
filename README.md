@@ -16,6 +16,10 @@ prototyped in `infra-ui` (Stage 18.2.b).
 - **`X-Cache-Invalidate` consumption**: mutating responses can list CSV URL
   prefixes for the wrapper to purge.
 - **Optional optimistic concurrency**: `expectedEtag` is sent as `If-Match`.
+- **Reactive `subscribe(url, cb)`** (v0.2.0): callback fires on cache populate
+  (with the data) and on invalidation (with `null`). Closes bug-class #7
+  "state mutation without re-render" — wire UI once, mutations re-render
+  automatically.
 - **Vanilla browser globals** — no bundler, no ESM. Exposes `window.API`,
   `window.ApiError`, and `window.API_UTILS_VERSION`.
 
@@ -33,7 +37,7 @@ Add to your service's `Dockerfile`, **before** the `COPY static/` step:
 ```dockerfile
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* \
-    && git clone --depth=1 --branch v0.1.0 https://github.com/c4uran/api-utils-js /tmp/au \
+    && git clone --depth=1 --branch v0.2.0 https://github.com/c4uran/api-utils-js /tmp/au \
     && mkdir -p /app/static \
     && cp /tmp/au/api.js /app/static/api.js \
     && rm -rf /tmp/au
@@ -48,7 +52,7 @@ the build pull it. The application's HTML loads it as a plain script:
 <script src="static/app.js"></script>
 ```
 
-After load, `window.API_UTILS_VERSION === "0.1.0"`.
+After load, `window.API_UTILS_VERSION === "0.2.0"`.
 
 ### Option B — Jenkinsfile / CI vendor step
 
@@ -64,6 +68,7 @@ API.put(url, body, opts?)   // → Promise<json|null>
 API.post(url, body, opts?)  // → Promise<json|null>
 API.delete(url, opts?)      // → Promise<json|null>
 API.clearCache(urlOrPrefix) // → void
+API.subscribe(url, cb)      // → unsubscribe()  (v0.2.0)
 ```
 
 `opts` for `get`:    `{ cache?: boolean, init?: RequestInit }`
@@ -71,6 +76,55 @@ API.clearCache(urlOrPrefix) // → void
 
 `ApiError` carries `.status` (HTTP code) and `.payload` (raw body text).
 Throws on non-2xx; aborted `get`s reject with `AbortError`.
+
+## Reactivity (`subscribe`) — closes bug-class #7
+
+Vanilla JS routinely "forgets" to re-render after a mutation:
+
+```js
+// BUG: state changed, UI didn't.
+async function init() {
+  const users = await API.get('/api/users');
+  render(users);
+}
+async function deleteUser(id) {
+  await API.delete(`/api/users/${id}`);
+  // FORGOT: refetch + render
+}
+```
+
+With `subscribe`, the re-render is wired once at init and triggers
+automatically on any invalidation:
+
+```js
+async function init() {
+  API.subscribe('/api/users', (data) => {
+    if (data === null) {
+      API.get('/api/users');  // invalidated → refetch (will fire subscriber again)
+    } else {
+      render(data);
+    }
+  });
+  await API.get('/api/users');  // initial fetch — triggers subscriber
+}
+
+async function deleteUser(id) {
+  await API.delete(`/api/users/${id}`);
+  // Backend's X-Cache-Invalidate: /api/users header
+  //   → clearCache(/api/users)
+  //   → subscriber notified with null
+  //   → refetch + render auto.
+}
+```
+
+The callback receives:
+- `data` (any JSON) — after a successful `API.get` populates the cache.
+- `null` — when the URL is invalidated (mutating verb, `X-Cache-Invalidate`,
+  or explicit `clearCache(urlOrPrefix)`).
+
+`subscribe` returns an unsubscribe function. Callbacks are isolated — one
+throwing does not affect siblings. Strictly opt-in: existing services see no
+behavioural change.
 
 ## Versioning
 
@@ -84,7 +138,7 @@ Throws on non-2xx; aborted `get`s reject with `AbortError`.
 node tests/test-api.mjs
 ```
 
-A 12-assertion Node harness that loads `api.js` into a `vm` sandbox with a
+An 18-assertion Node harness that loads `api.js` into a `vm` sandbox with a
 fake `window`, stands up an `http.createServer`, and exercises GET caching,
 cancellation, mutate-invalidates, `X-Cache-Invalidate`, latest-wins race,
 `If-Match`, `ApiError`, and prefix `clearCache`. No browser needed.

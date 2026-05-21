@@ -20,16 +20,60 @@
 //   API.post(url, body, opts?)  → Promise<json|null>
 //   API.delete(url, opts?)      → Promise<json|null>
 //   API.clearCache(urlOrPrefix) → void
+//   API.subscribe(url, cb)      → unsubscribe()
 //
 // opts for GET:    { cache?: boolean, init?: RequestInit }
 // opts for mutate: { headers?: object, expectedEtag?: string }
+//
+// Reactivity (v0.2.0 — Stage 18.7, closes bug-class #7 "state without
+// re-render"). `subscribe(url, cb)` fires the callback when:
+//   - The URL's cache entry is freshly populated by a successful `API.get`.
+//   - The URL is invalidated via mutating verb / `X-Cache-Invalidate` /
+//     explicit `clearCache(prefix)`. The callback receives `null` as the
+//     invalidation signal — consumer typically re-fetches and re-renders.
+// Opt-in: existing callers see no behavioural change. See README for the
+// closes-#7 usage pattern.
 
 (function () {
   'use strict';
 
   const CACHE_TTL_MS = 60000;
-  const _CACHE = new Map();    // url → {data, etag, cachedAt}
-  const _PENDING = new Map();  // url → AbortController for the latest in-flight GET
+  const _CACHE = new Map();        // url → {data, etag, cachedAt}
+  const _PENDING = new Map();      // url → AbortController for the latest in-flight GET
+  const _SUBSCRIBERS = new Map();  // url → Set<callback>
+
+  // Fire every subscriber for `url` with `data` (or null for invalidation).
+  // Each callback is wrapped — one throw must not break the others.
+  function _notify(url, data) {
+    const subs = _SUBSCRIBERS.get(url);
+    if (!subs || subs.size === 0) return;
+    for (const cb of subs) {
+      try {
+        cb(data);
+      } catch (e) {
+        // Surface but don't propagate — subscribers are observers, not gates.
+        try { console.error('API.subscribe callback failed for', url, e); } catch {}
+      }
+    }
+  }
+
+  function subscribe(url, callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('API.subscribe(url, callback): callback must be a function');
+    }
+    let set = _SUBSCRIBERS.get(url);
+    if (!set) {
+      set = new Set();
+      _SUBSCRIBERS.set(url, set);
+    }
+    set.add(callback);
+    return function unsubscribe() {
+      const s = _SUBSCRIBERS.get(url);
+      if (!s) return;
+      s.delete(callback);
+      if (s.size === 0) _SUBSCRIBERS.delete(url);
+    };
+  }
 
   class ApiError extends Error {
     constructor(message, status, payload) {
@@ -42,9 +86,13 @@
 
   function clearCache(urlOrPrefix) {
     if (!urlOrPrefix) {
+      // Full wipe — notify every subscribed URL (whether it had a cache entry
+      // or not; subscribers exist for URLs that may never have been GET'd).
       _CACHE.clear();
+      for (const url of _SUBSCRIBERS.keys()) _notify(url, null);
       return;
     }
+    const cleared = [];
     for (const k of Array.from(_CACHE.keys())) {
       if (
         k === urlOrPrefix ||
@@ -52,6 +100,25 @@
         k.indexOf(urlOrPrefix + '/') === 0
       ) {
         _CACHE.delete(k);
+        cleared.push(k);
+      }
+    }
+    // Notify any subscriber whose URL was just invalidated, plus any
+    // subscriber for the exact prefix (it may not have had a cache entry yet
+    // but still wants to know the prefix was invalidated — e.g. a list view
+    // that hasn't loaded yet but is wired up).
+    const notified = new Set();
+    for (const k of cleared) {
+      if (_SUBSCRIBERS.has(k)) { _notify(k, null); notified.add(k); }
+    }
+    for (const url of _SUBSCRIBERS.keys()) {
+      if (notified.has(url)) continue;
+      if (
+        url === urlOrPrefix ||
+        url.indexOf(urlOrPrefix + '?') === 0 ||
+        url.indexOf(urlOrPrefix + '/') === 0
+      ) {
+        _notify(url, null);
       }
     }
   }
@@ -99,6 +166,7 @@
       // earlier abort might race-overwrite fresher data.
       if (_PENDING.get(url) === ctrl) {
         _CACHE.set(url, { data, etag, cachedAt: Date.now() });
+        _notify(url, data);
       }
       return data;
     } finally {
@@ -160,10 +228,11 @@
     post: (url, body, opts) => apiMutate('POST', url, body, opts),
     delete: (url, opts) => apiMutate('DELETE', url, null, opts),
     clearCache,
+    subscribe,
   };
 
   // Expose as globals — infra-ui has no bundler.
   window.API = API;
   window.ApiError = ApiError;
-  window.API_UTILS_VERSION = '0.1.0';
+  window.API_UTILS_VERSION = '0.2.0';
 })();

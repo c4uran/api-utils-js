@@ -15,6 +15,8 @@ const sandbox = {
   fetch: globalThis.fetch,
   AbortController: globalThis.AbortController,
   Map: globalThis.Map,
+  Set: globalThis.Set,
+  TypeError: globalThis.TypeError,
   Date: globalThis.Date,
   Object: globalThis.Object,
   console: globalThis.console,
@@ -153,6 +155,75 @@ await API.get(`${base}/api/users/42`);
 await API.get(`${base}/api/other`);
 check('prefix-cleared paths re-fetched, others cached', reqLog.length === 3,
   `reqLog=${reqLog.length}`);
+
+// ── T10: subscribe — get fires callback ──
+console.log('T10 subscribe on GET');
+API.clearCache(`${base}/sub1`);
+let events = [];
+let unsub = API.subscribe(`${base}/sub1`, (d) => events.push(d));
+await API.get(`${base}/sub1`);
+check('subscribe fires on cache populate', events.length === 1 && events[0] && events[0].url === '/sub1',
+  `events=${JSON.stringify(events)}`);
+
+// ── T11: subscribe — invalidation via mutate fires null ──
+console.log('T11 subscribe on invalidate (mutate)');
+events.length = 0;
+await API.post(`${base}/sub1`, { x: 1 });
+check('subscribe fires null on mutate-invalidate',
+  events.length === 1 && events[0] === null,
+  `events=${JSON.stringify(events)}`);
+
+// ── T12: subscribe — clearCache(prefix) fires null ──
+console.log('T12 subscribe on clearCache prefix');
+await API.get(`${base}/sub1`);  // re-populate
+events.length = 0;
+API.clearCache(`${base}/sub1`);
+check('subscribe fires null on clearCache(prefix)',
+  events.length === 1 && events[0] === null);
+
+// ── T13: unsubscribe stops callbacks ──
+console.log('T13 unsubscribe');
+unsub();
+events.length = 0;
+await API.get(`${base}/sub1`);
+check('callback silent after unsubscribe', events.length === 0,
+  `events=${JSON.stringify(events)}`);
+
+// ── T14: subscribe — full closes-#7 flow (init → mutate → auto re-render) ──
+console.log('T14 closes-#7 flow');
+API.clearCache(`${base}/api/users`);
+const renderLog = [];
+let renderUnsub = API.subscribe(`${base}/api/users`, (data) => {
+  if (data === null) {
+    // Invalidated — re-fetch (which will fire subscriber again with data).
+    API.get(`${base}/api/users`);
+  } else {
+    renderLog.push(data.n);
+  }
+});
+await API.get(`${base}/api/users`);  // initial — renderLog gets 1 entry
+const beforeMutate = renderLog.length;
+// Backend signals "list URL invalidated" via X-Cache-Invalidate header —
+// this is exactly the closes-#7 contract from the README.
+await API.delete(`${base}/api/users/42`, {
+  headers: { 'x-test-invalidate': `${base}/api/users` },
+});
+// Allow microtask for the re-fetch chain.
+await new Promise(r => setTimeout(r, 50));
+check('renderLog got re-render after mutate w/o manual call',
+  renderLog.length === beforeMutate + 1,
+  `before=${beforeMutate} after=${renderLog.length}`);
+renderUnsub();
+
+// ── T15: callback exception doesn't break sibling subscribers ──
+console.log('T15 callback isolation');
+API.clearCache(`${base}/iso`);
+let goodFired = false;
+const u1 = API.subscribe(`${base}/iso`, () => { throw new Error('boom'); });
+const u2 = API.subscribe(`${base}/iso`, () => { goodFired = true; });
+await API.get(`${base}/iso`);
+check('sibling subscriber still ran', goodFired);
+u1(); u2();
 
 srv.close();
 console.log(`\n${pass} passed, ${fail} failed`);
