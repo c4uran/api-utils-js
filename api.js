@@ -83,7 +83,8 @@
 
     try {
       const init = Object.assign({}, o.init || {}, { signal: ctrl.signal });
-      const r = await fetch(url, init);
+      // eslint-disable-next-line infra/no-bare-fetch
+      const r = await fetch(url, init); // nosemgrep: fe-no-bare-fetch
       if (!r.ok) {
         let body = '';
         try {
@@ -128,7 +129,8 @@
       headers,
       body: body !== null && body !== undefined ? JSON.stringify(body) : undefined,
     };
-    const r = await fetch(url, init);
+    // eslint-disable-next-line infra/no-bare-fetch
+    const r = await fetch(url, init); // nosemgrep: fe-no-bare-fetch
     if (!r.ok) {
       let errBody = '';
       try {
